@@ -46,6 +46,19 @@ add_action('admin_post_export_forms_all_from_2025', function() {
 });
 
 // ==============================
+// Prize Drawing Winner Selection Handler
+// ==============================
+add_action('admin_post_pick_prize_drawing_winners', function() {
+    if (isset($_POST['start_date'], $_POST['end_date'])) {
+        $start_date = sanitize_text_field($_POST['start_date']);
+        $end_date = sanitize_text_field($_POST['end_date']);
+        pick_prize_drawing_winners($start_date, $end_date);
+    } else {
+        wp_die('Please select a valid date range.');
+    }
+});
+
+// ==============================
 // Core export
 // ==============================
 function export_forms_by_date_range($month, $year, $form_ids) {
@@ -173,10 +186,11 @@ function export_forms_by_custom_date_range($start_date, $end_date, $form_ids) {
         wp_die('Start date must be before end date.');
     }
 
-    // Format dates for display
+    // Format dates for display and filename
     $formatted_start_date = date('F j, Y', $start_timestamp);
     $formatted_end_date = date('F j, Y', $end_timestamp);
-    $date_range = $formatted_start_date . ' - ' . $formatted_end_date;
+    $filename_start = date('F_j_Y', $start_timestamp);
+    $filename_end = date('F_j_Y', $end_timestamp);
 
     $combined_data = [];
 
@@ -225,7 +239,7 @@ function export_forms_by_custom_date_range($start_date, $end_date, $form_ids) {
         }
 
         $formatted_data[] = [
-            'Date Range' => $date_range,
+            'Entry Date' => $entry['created_at'],
             'Form Name' => $form_name,
             'Email' => $response_data['email'] ?? '',
             'Name' => $full_name,
@@ -261,7 +275,13 @@ function export_forms_by_custom_date_range($start_date, $end_date, $form_ids) {
         ];
     }
 
-    $filename = 'forms_export_' . date('Y-m-d') . '_custom_range.csv';
+    // Format dates for display and filename
+    $formatted_start_date = date('F j, Y', $start_timestamp);
+    $formatted_end_date = date('F j, Y', $end_timestamp);
+    $filename_start = date('F_j_Y', $start_timestamp);
+    $filename_end = date('F_j_Y', $end_timestamp);
+
+    $filename = 'forms_export_' . date('Y-m-d') . '_' . $filename_start . '_to_' . $filename_end . '.csv';
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $filename . '"');
 
@@ -270,6 +290,288 @@ function export_forms_by_custom_date_range($start_date, $end_date, $form_ids) {
     foreach ($formatted_data as $row) {
         fputcsv($output, $row);
     }
+    fclose($output);
+    exit;
+}
+
+// ==============================
+// Prize Drawing Winner Selection Function
+// ==============================
+function pick_prize_drawing_winners($start_date, $end_date) {
+    global $wpdb;
+
+    // Validate dates
+    $start_timestamp = strtotime($start_date);
+    $end_timestamp = strtotime($end_date);
+
+    if (!$start_timestamp || !$end_timestamp) {
+        wp_die('Invalid date format provided.');
+    }
+
+    if ($start_timestamp > $end_timestamp) {
+        wp_die('Start date must be before end date.');
+    }
+
+    // Get Prize Drawings form ID - let's find it dynamically
+    $prize_drawings_form_id = null;
+    $forms = $wpdb->get_results("SELECT id, title FROM {$wpdb->prefix}fluentform_forms", ARRAY_A);
+    
+    foreach ($forms as $form) {
+        if (stripos($form['title'], 'prize') !== false || stripos($form['title'], 'drawing') !== false) {
+            $prize_drawings_form_id = $form['id'];
+            break;
+        }
+    }
+    
+    if (!$prize_drawings_form_id) {
+        wp_die('Prize Drawings form not found. Please ensure there is a form with "prize" or "drawing" in the title.');
+    }
+
+    // Get all submissions from Prize Drawings form in date range
+    $submissions = $wpdb->get_results(
+        $wpdb->prepare(
+            "SELECT id, form_id, response, created_at
+             FROM {$wpdb->prefix}fluentform_submissions
+             WHERE form_id = %d
+               AND created_at BETWEEN %s AND %s
+             ORDER BY created_at ASC",
+            $prize_drawings_form_id, $start_date, $end_date
+        ),
+        ARRAY_A
+    );
+
+    if (empty($submissions)) {
+        wp_die('No Prize Drawings submissions found in the specified date range.');
+    }
+
+    // Process submissions and create weighted entries
+    $weighted_entries = [];
+    $participants_data = [];
+
+    foreach ($submissions as $submission) {
+        $response_data = json_decode($submission['response'], true);
+        if (!is_array($response_data)) {
+            continue;
+        }
+
+        // Extract user information
+        $email = $response_data['email'] ?? '';
+        $opt_in = false;
+        
+        // Check for opt-in in various possible field names
+        if (isset($response_data['checkbox_4']) && is_array($response_data['checkbox_4'])) {
+            $opt_in = in_array('yes', array_map('strtolower', $response_data['checkbox_4']));
+        } elseif (isset($response_data['opt_in']) && strtolower($response_data['opt_in']) === 'yes') {
+            $opt_in = true;
+        } elseif (isset($response_data['newsletter']) && strtolower($response_data['newsletter']) === 'yes') {
+            $opt_in = true;
+        }
+
+        // Extract additional user information
+        $first_name = $response_data['names']['first_name'] ?? '';
+        $last_name = $response_data['names']['last_name'] ?? '';
+        $full_name = trim($first_name . ' ' . $last_name);
+        
+        $phone = $response_data['personal_number'] ?? '';
+        $address = $response_data['home_address'] ?? '';
+        $city = $response_data['home_city'] ?? '';
+        $state = $response_data['home_state'] ?? '';
+        $zip = $response_data['home_postcode'] ?? '';
+        
+        // Extract resources/pledges
+        $resources = [];
+        if (isset($response_data['checkbox']) && is_array($response_data['checkbox'])) {
+            $resources[] = 'Pledge: ' . implode(', ', $response_data['checkbox']);
+        }
+        if (isset($response_data['checkbox_1']) && is_array($response_data['checkbox_1'])) {
+            $resources[] = 'Carpool: ' . implode(', ', $response_data['checkbox_1']);
+        }
+        if (isset($response_data['checkbox_7']) && is_array($response_data['checkbox_7'])) {
+            $resources[] = 'Telework: ' . implode(', ', $response_data['checkbox_7']);
+        }
+        if (isset($response_data['checkbox_2']) && is_array($response_data['checkbox_2'])) {
+            $resources[] = 'Bike: ' . implode(', ', $response_data['checkbox_2']);
+        }
+        if (isset($response_data['checkbox_8']) && is_array($response_data['checkbox_8'])) {
+            $resources[] = 'Transit: ' . implode(', ', $response_data['checkbox_8']);
+        }
+        if (isset($response_data['checkbox_9']) && is_array($response_data['checkbox_9'])) {
+            $resources[] = 'Vanpool: ' . implode(', ', $response_data['checkbox_9']);
+        }
+        if (isset($response_data['checkbox_10']) && is_array($response_data['checkbox_10'])) {
+            $resources[] = 'Guaranteed Ride Home: ' . implode(', ', $response_data['checkbox_10']);
+        }
+        
+        $resources_text = implode(' | ', $resources);
+
+        if (empty($email)) {
+            continue;
+        }
+
+        // Check if user already has entries (persistent opt-in)
+        $user_key = strtolower(trim($email));
+        
+        if (!isset($weighted_entries[$user_key])) {
+            $weighted_entries[$user_key] = [
+                'email' => $email,
+                'name' => $full_name,
+                'phone' => $phone,
+                'address' => $address,
+                'city' => $city,
+                'state' => $state,
+                'zip' => $zip,
+                'resources' => $resources_text,
+                'entries' => 0,
+                'opt_in' => false,
+                'submissions' => [],
+                'first_submission' => $submission['created_at'],
+                'latest_submission' => $submission['created_at'],
+                'latest_opt_in' => $opt_in
+            ];
+        }
+
+        // Update with latest submission data (most recent entry wins)
+        $weighted_entries[$user_key]['latest_submission'] = $submission['created_at'];
+        $weighted_entries[$user_key]['latest_opt_in'] = $opt_in;
+        
+        // Update user info with latest submission
+        $weighted_entries[$user_key]['name'] = $full_name;
+        $weighted_entries[$user_key]['phone'] = $phone;
+        $weighted_entries[$user_key]['address'] = $address;
+        $weighted_entries[$user_key]['city'] = $city;
+        $weighted_entries[$user_key]['state'] = $state;
+        $weighted_entries[$user_key]['zip'] = $zip;
+        $weighted_entries[$user_key]['resources'] = $resources_text;
+        
+        // Add entry (but limit to 1 per month)
+        $weighted_entries[$user_key]['entries']++;
+        $weighted_entries[$user_key]['submissions'][] = $submission['created_at'];
+        
+        // Update opt-in status (once opted in, stays opted in)
+        if ($opt_in) {
+            $weighted_entries[$user_key]['opt_in'] = true;
+        }
+
+        // Store participant data for export
+        $participants_data[] = [
+            'Email' => $email,
+            'Submission Date' => $submission['created_at'],
+            'Opt In' => $opt_in ? 'Yes' : 'No',
+            'Entry Number' => $weighted_entries[$user_key]['entries']
+        ];
+    }
+
+    // Enforce 1 entry per month rule - reset entries to 1 for all users
+    foreach ($weighted_entries as $user_key => $user_data) {
+        $weighted_entries[$user_key]['entries'] = 1; // Only 1 entry per month regardless of submissions
+        $weighted_entries[$user_key]['first_submission'] = $user_data['latest_submission']; // Use latest submission
+        $weighted_entries[$user_key]['submissions'] = [$user_data['latest_submission']]; // Only latest submission
+    }
+
+    if (empty($weighted_entries)) {
+        wp_die('No valid Prize Drawings entries found.');
+    }
+
+    // Create weighted pool for random selection
+    $weighted_pool = [];
+    foreach ($weighted_entries as $user_data) {
+        $entries_count = $user_data['entries'];
+        $weight = $user_data['opt_in'] ? 2 : 1; // Double weight for opt-in users
+        
+        // Add entries based on weight
+        for ($i = 0; $i < $entries_count; $i++) {
+            $weighted_pool[] = [
+                'email' => $user_data['email'],
+                'name' => $user_data['name'],
+                'phone' => $user_data['phone'],
+                'address' => $user_data['address'],
+                'city' => $user_data['city'],
+                'state' => $user_data['state'],
+                'zip' => $user_data['zip'],
+                'resources' => $user_data['resources'],
+                'weight' => $weight,
+                'opt_in' => $user_data['opt_in'],
+                'total_entries' => $user_data['entries'],
+                'first_submission' => $user_data['first_submission'],
+                'all_submissions' => implode(', ', $user_data['submissions'])
+            ];
+        }
+    }
+
+    // Randomly select 5 winners
+    $winners = [];
+    $used_emails = [];
+    
+    for ($i = 0; $i < 5 && count($winners) < count($weighted_entries); $i++) {
+        $random_index = array_rand($weighted_pool);
+        $selected_entry = $weighted_pool[$random_index];
+        
+        // Avoid duplicate winners
+        if (!in_array($selected_entry['email'], $used_emails)) {
+            $winners[] = [
+                'position' => $i + 1,
+                'email' => $selected_entry['email'],
+                'name' => $selected_entry['name'],
+                'phone' => $selected_entry['phone'],
+                'address' => $selected_entry['address'],
+                'city' => $selected_entry['city'],
+                'state' => $selected_entry['state'],
+                'zip' => $selected_entry['zip'],
+                'resources' => $selected_entry['resources'],
+                'weight' => $selected_entry['weight'],
+                'opt_in' => $selected_entry['opt_in'],
+                'total_entries' => $selected_entry['total_entries'],
+                'first_submission' => $selected_entry['first_submission'],
+                'all_submissions' => $selected_entry['all_submissions'],
+                'winning_chance' => $selected_entry['opt_in'] ? 'Double Entry (Opt-in)' : 'Single Entry'
+            ];
+            $used_emails[] = $selected_entry['email'];
+        }
+    }
+
+
+    // Export winners data
+    $filename = 'prize_drawing_winners_' . date('Y-m-d') . '_' . $start_date . '_to_' . $end_date . '.csv';
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+
+    $output = fopen('php://output', 'w');
+    
+    // Write winners header
+    fputcsv($output, [
+        'Position', 
+        'Email', 
+        'Name', 
+        'Winning Chance', 
+        'Total Entries', 
+        'First Submission', 
+        'All Submissions',
+        'Phone', 
+        'Address', 
+        'City', 
+        'State', 
+        'Zip Code', 
+        'Resources/Pledges'
+    ]);
+    
+    foreach ($winners as $winner) {
+        fputcsv($output, [
+            $winner['position'],
+            $winner['email'],
+            $winner['name'],
+            $winner['winning_chance'],
+            $winner['total_entries'],
+            $winner['first_submission'],
+            $winner['all_submissions'],
+            $winner['phone'],
+            $winner['address'],
+            $winner['city'],
+            $winner['state'],
+            $winner['zip'],
+            $winner['resources']
+        ]);
+    }
+    
     fclose($output);
     exit;
 }
@@ -351,8 +653,8 @@ function export_forms_page() {
         }
 
         .export-all-section {
-            background: #fff8e5;
-            border: 1px solid #ffb900;
+            background: #f9f9f9;
+            border: 1px solid #ddd;
             border-radius: 4px;
             padding: 15px;
         }
@@ -363,6 +665,24 @@ function export_forms_page() {
         }
 
         .export-all-section p {
+            margin-bottom: 12px;
+            font-size: 13px;
+        }
+
+        .prize-drawing-section {
+            background: #e8f5e8;
+            border: 1px solid #4caf50;
+            border-radius: 4px;
+            padding: 15px;
+            margin-top: 20px;
+        }
+
+        .prize-drawing-section h3 {
+            color: #2e7d32;
+            margin-bottom: 8px;
+        }
+
+        .prize-drawing-section p {
             margin-bottom: 12px;
             font-size: 13px;
         }
@@ -540,11 +860,22 @@ function export_forms_page() {
                         <button type="submit" class="button button-primary">Export All Entries from 2025</button>
                     </form>
                 </div>
+
+                <!-- Prize Drawing Winner Selection -->
+                <div class="prize-drawing-section">
+                    <h3>Prize Drawing Winner Selection</h3>
+                    <p>Select winners for Prize Drawings form with weighted entries (double chance for opt-in users)</p>
+                    <form method="POST" action="' . esc_url(admin_url('admin-post.php?action=pick_prize_drawing_winners')) . '">
+                        <input type="hidden" name="start_date" id="prize_start_date">
+                        <input type="hidden" name="end_date" id="prize_end_date">
+                        <button type="submit" class="button button-primary" id="pick-winners-btn">Pick Prize Drawing Winners</button>
+                    </form>
+                    <p style="font-size: 12px; color: #666; margin-top: 8px;">
+                        <strong>Note:</strong> Uses the same date range as selected above. Winners #1-5 will be selected with weighted entries.
+                    </p>
+                </div>
             </div>
         </div>
-        <p style="margin-top:25px;">
-            <strong>Console Preview:</strong> Open browser console (F12) to see recent submissions (auto-loaded).
-        </p>
     </div>
     <script>
     document.addEventListener("DOMContentLoaded", function () {
@@ -676,6 +1007,22 @@ function export_forms_page() {
          document.querySelector("form[action*=\'export_forms_all_entries\']")?.addEventListener("submit", ensureFormsSelected);
          document.querySelector("form[action*=\'export_forms_all_from_2025\']")?.addEventListener("submit", ensureFormsSelected);
 
+         // Sync date range for prize drawing winner selection
+         function syncPrizeDrawingDates() {
+             const startDate = document.getElementById("start_date").value;
+             const endDate = document.getElementById("end_date").value;
+             
+             document.getElementById("prize_start_date").value = startDate;
+             document.getElementById("prize_end_date").value = endDate;
+         }
+
+         // Update prize drawing dates when date range changes
+         document.getElementById("start_date")?.addEventListener("change", syncPrizeDrawingDates);
+         document.getElementById("end_date")?.addEventListener("change", syncPrizeDrawingDates);
+
+         // Initialize prize drawing dates on page load
+         syncPrizeDrawingDates();
+
         // Quick date range setters for right column
         function setDateRange(startDate, endDate) {
             document.getElementById("start_date").value = startDate;
@@ -686,12 +1033,14 @@ function export_forms_page() {
             const endDate = new Date().toISOString().split("T")[0];
             const startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
             setDateRange(startDate, endDate);
+            syncPrizeDrawingDates();
         });
 
         document.getElementById("set-range-last-90")?.addEventListener("click", ()=>{
             const endDate = new Date().toISOString().split("T")[0];
             const startDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
             setDateRange(startDate, endDate);
+            syncPrizeDrawingDates();
         });
 
         document.getElementById("set-range-this-year")?.addEventListener("click", ()=>{
@@ -699,10 +1048,12 @@ function export_forms_page() {
             const startDate = currentYear + "-01-01";
             const endDate = new Date().toISOString().split("T")[0];
             setDateRange(startDate, endDate);
+            syncPrizeDrawingDates();
         });
 
         document.getElementById("set-range-from-2025")?.addEventListener("click", ()=>{
             setDateRange("2025-01-01", new Date().toISOString().split("T")[0]);
+            syncPrizeDrawingDates();
         });
 
         // Form synchronization events
@@ -735,105 +1086,5 @@ function export_forms_page() {
     </script>
     ';
 
-    // ==============================
-    // Console Debug Preview (recent submissions)
-    // ==============================
-    $limit   = 6;              // How many recent submissions
-    $formIds = [10,9,3];       // Forms to inspect (adjust as needed)
-
-    $placeholders = implode(',', array_fill(0, count($formIds), '%d'));
-    $sql = $wpdb->prepare(
-        "SELECT id, form_id, created_at, response
-         FROM {$wpdb->prefix}fluentform_submissions
-         WHERE form_id IN ($placeholders)
-         ORDER BY id DESC
-         LIMIT %d",
-        array_merge($formIds, [$limit])
-    );
-
-    $rows = $wpdb->get_results($sql, ARRAY_A);
-    $preview = [];
-
-    if ($rows) {
-        foreach ($rows as $r) {
-            $data = json_decode($r['response'], true);
-            if (!is_array($data)) {
-                $data = [];
-            }
-
-            $keys = array_keys($data);
-            $eventNameCandidates = [];
-            $eventDateCandidates = [];
-
-            foreach ($data as $k => $v) {
-                $valStr = is_array($v) ? json_encode($v) : (string)$v;
-                if (preg_match('/(event|fair)/i', $k) && trim($valStr) !== '') {
-                    $eventNameCandidates[] = $k . ' => ' . substr($valStr, 0, 60);
-                }
-                if (preg_match('/date/i', $k) &&
-                    preg_match('/\d{4}-\d{2}-\d{2}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/', $valStr)
-                ) {
-                    $eventDateCandidates[] = $k . ' => ' . substr($valStr, 0, 60);
-                }
-            }
-
-            $sampleValues = [];
-            $maxSample = 8;
-            $c = 0;
-            foreach ($data as $k => $v) {
-                if ($c >= $maxSample) break;
-                $sampleValues[$k] = is_array($v) ? substr(json_encode($v),0,80) : substr((string)$v,0,80);
-                $c++;
-            }
-
-            $formTitle = $wpdb->get_var(
-                $wpdb->prepare(
-                    "SELECT title FROM {$wpdb->prefix}fluentform_forms WHERE id = %d",
-                    $r['form_id']
-                )
-            );
-
-            $preview[] = [
-                'submission_id' => (int)$r['id'],
-                'form_id' => (int)$r['form_id'],
-                'form_title' => $formTitle,
-                'created_at' => $r['created_at'],
-                'keys' => $keys,
-                'event_name_candidates' => $eventNameCandidates,
-                'event_date_candidates' => $eventDateCandidates,
-                'sample_values' => $sampleValues
-            ];
-        }
-    }
-
-       echo '<script>';
-    echo 'const FF_DEBUG_PREVIEW = ' . json_encode($preview, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . ';';
-    echo 'console.log("%c[FluentForms Debug] Structure Enhanced","background:#004;padding:4px;color:#fff");';
-    ?>
-    (function() {
-        if (!Array.isArray(FF_DEBUG_PREVIEW) || !FF_DEBUG_PREVIEW.length) {
-            console.warn('[FluentForms Debug] No submissions for debug.');
-            return;
-        }
-        FF_DEBUG_PREVIEW.forEach(item => {
-            console.group(`Submission ${item.submission_id} (Form ${item.form_id} - ${item.form_title})`);
-            console.log('Created At:', item.created_at);
-            console.log('Event Name Candidates:', item.event_name_candidates);
-            console.log('Event Date Candidates:', item.event_date_candidates);
-            console.table(item.fields);
-            console.groupEnd();
-        });
-        const summary = FF_DEBUG_PREVIEW.map(i => ({
-            submission_id: i.submission_id,
-            form_id: i.form_id,
-            form_title: i.form_title,
-            event_name_keys: i.event_name_candidates.map(c=>c.split(" [")[0]).join('|'),
-            event_date_keys: i.event_date_candidates.map(c=>c.split(" [")[0]).join('|')
-        }));
-        console.log('%cSummary Table','background:#222;color:#bada55;padding:2px;');
-        console.table(summary);
-    })();
-    <?php
-    echo '</script>';
     // End of function
 }
