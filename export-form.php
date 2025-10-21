@@ -99,16 +99,16 @@ add_action('admin_post_pick_prize_drawing_winners', function() {
             !empty($_POST['start_date']) && !empty($_POST['end_date'])) {
         $start_date = sanitize_text_field($_POST['start_date']);
         $end_date = sanitize_text_field($_POST['end_date']);
-        
-        // Intentar convertir formatos de fecha si es necesario
+
+        // Try to convert date formats if necessary
         if (preg_match('/^\d{2}\/\d{2}\/\d{4}$/', $start_date)) {
-            // Convertir de MM/DD/YYYY a YYYY-MM-DD
+            // Convert from MM/DD/YYYY to YYYY-MM-DD
             $date_parts = explode('/', $start_date);
             $start_date = $date_parts[2] . '-' . $date_parts[0] . '-' . $date_parts[1];
         }
         
         if (preg_match('/^\d{2}\/\d{2}\/\d{4}$/', $end_date)) {
-            // Convertir de MM/DD/YYYY a YYYY-MM-DD
+            // Convert from MM/DD/YYYY to YYYY-MM-DD
             $date_parts = explode('/', $end_date);
             $end_date = $date_parts[2] . '-' . $date_parts[0] . '-' . $date_parts[1];
         }
@@ -132,26 +132,89 @@ function export_forms_by_date_range($month, $year, $form_ids) {
     // Dates
     $start_date = date('Y-m-d', strtotime("$year-$month-01"));
     $end_date   = date('Y-m-t', strtotime("$year-$month-01"));
+    $start_timestamp = strtotime($start_date);
+    $end_timestamp = strtotime($end_date . ' 23:59:59');
 
     $month_name = date('F', strtotime("$year-$month-01"));
     $date_range = strtolower($month_name) . ' ' . date('j', strtotime($start_date)) . '-' . date('j', strtotime($end_date));
 
+    // Get all forms to identify Manual Entry forms
+    $all_forms = $wpdb->get_results("SELECT id, title FROM {$wpdb->prefix}fluentform_forms", ARRAY_A);
+    $manual_entry_form_ids = [];
+    
+    foreach ($all_forms as $form) {
+        // Identify Manual Entry forms
+        if (stripos($form['title'], 'manual') !== false || 
+            stripos($form['title'], 'entry') !== false ||
+            stripos($form['title'], 'fair') !== false ||
+            stripos($form['title'], 'event') !== false) {
+            $manual_entry_form_ids[] = $form['id'];
+        }
+    }
+
     $combined_data = [];
 
     foreach ($form_ids as $form_id) {
-        $results = $wpdb->get_results(
-            $wpdb->prepare(
-                "SELECT id, form_id, response, source_url, created_at
-                 FROM {$wpdb->prefix}fluentform_submissions
-                 WHERE form_id = %d
-                   AND created_at BETWEEN %s AND %s",
-                $form_id, $start_date, $end_date
-            ),
-            ARRAY_A
-        );
+        // Check if this is a Manual Entry form
+        $is_manual_entry = in_array($form_id, $manual_entry_form_ids);
+        
+        if ($is_manual_entry) {
+            // For Manual Entry: Get ALL entries and filter by Event/Fair Date in PHP
+            $results = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT id, form_id, response, source_url, created_at
+                     FROM {$wpdb->prefix}fluentform_submissions
+                     WHERE form_id = %d",
+                    $form_id
+                ),
+                ARRAY_A
+            );
+            
+            // Filter by Event/Fair Date
+            foreach ($results as $entry) {
+                $response_data = json_decode($entry['response'], true);
+                if (!is_array($response_data)) {
+                    continue;
+                }
+                
+                // Try to find Event/Fair Date
+                $event_date_field = null;
+                if (isset($response_data['datetime_2']) && !empty($response_data['datetime_2'])) {
+                    $event_date_field = $response_data['datetime_2'];
+                } elseif (isset($response_data['datetime_1']) && !empty($response_data['datetime_1'])) {
+                    $event_date_field = $response_data['datetime_1'];
+                } elseif (isset($response_data['datetime']) && !empty($response_data['datetime'])) {
+                    $event_date_field = $response_data['datetime'];
+                } elseif (isset($response_data['event_date']) && !empty($response_data['event_date'])) {
+                    $event_date_field = $response_data['event_date'];
+                } elseif (isset($response_data['fair_date']) && !empty($response_data['fair_date'])) {
+                    $event_date_field = $response_data['fair_date'];
+                }
+                
+                // Only include if Event/Fair Date is within range
+                if ($event_date_field) {
+                    $event_timestamp = strtotime($event_date_field);
+                    if ($event_timestamp && $event_timestamp >= $start_timestamp && $event_timestamp <= $end_timestamp) {
+                        $combined_data[] = $entry;
+                    }
+                }
+            }
+        } else {
+            // For other forms: Use created_at as before
+            $results = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT id, form_id, response, source_url, created_at
+                     FROM {$wpdb->prefix}fluentform_submissions
+                     WHERE form_id = %d
+                       AND created_at BETWEEN %s AND %s",
+                    $form_id, $start_date, $end_date
+                ),
+                ARRAY_A
+            );
 
-        if ($results) {
-            $combined_data = array_merge($combined_data, $results);
+            if ($results) {
+                $combined_data = array_merge($combined_data, $results);
+            }
         }
     }
 
@@ -182,6 +245,9 @@ function export_forms_by_date_range($month, $year, $form_ids) {
             $last  = $response_data['names']['last_name'] ?? '';
             $full_name = trim($first . ' ' . $last);
         }
+
+        // Get Event/Fair Date from response or use end_date as fallback
+        $event_fair_date = $response_data['datetime_2'] ?? date('Y-m-d', strtotime($end_date));
 
         $formatted_data[] = [
             'Entry Date' => $entry['created_at'],
@@ -216,7 +282,7 @@ function export_forms_by_date_range($month, $year, $form_ids) {
             'HM days a week do you drive alone' => $response_data['dropdown_3'] ?? '',
             'Opt in Form' => (isset($response_data['checkbox_4'][0]) && strtolower($response_data['checkbox_4'][0]) === 'yes') ? 'Yes' : '',
             'Event/Fair Name' => $response_data['input_text_4'] ?? '',
-            'Event/Fair Date' => $response_data['datetime_2'] ?? ''
+            'Event/Fair Date' => $event_fair_date
         ];
     }
 
@@ -260,7 +326,7 @@ function export_forms_by_custom_date_range($start_date, $end_date, $form_ids) {
 
     // Validate dates
     $start_timestamp = strtotime($start_date);
-    $end_timestamp = strtotime($end_date);
+    $end_timestamp = strtotime($end_date . ' 23:59:59');
 
     if (!$start_timestamp || !$end_timestamp) {
         wp_die('Invalid date format provided.');
@@ -277,22 +343,83 @@ function export_forms_by_custom_date_range($start_date, $end_date, $form_ids) {
     $filename_start = date('F_j_Y', $start_timestamp);
     $filename_end = date('F_j_Y', $end_timestamp);
 
+    // Get all forms to identify Manual Entry forms
+    $all_forms = $wpdb->get_results("SELECT id, title FROM {$wpdb->prefix}fluentform_forms", ARRAY_A);
+    $manual_entry_form_ids = [];
+    
+    foreach ($all_forms as $form) {
+        // Identify Manual Entry forms
+        if (stripos($form['title'], 'manual') !== false || 
+            stripos($form['title'], 'entry') !== false ||
+            stripos($form['title'], 'fair') !== false ||
+            stripos($form['title'], 'event') !== false) {
+            $manual_entry_form_ids[] = $form['id'];
+        }
+    }
+
     $combined_data = [];
 
     foreach ($form_ids as $form_id) {
-        $results = $wpdb->get_results(
-            $wpdb->prepare(
-                "SELECT id, form_id, response, source_url, created_at
-                 FROM {$wpdb->prefix}fluentform_submissions
-                 WHERE form_id = %d
-                   AND created_at BETWEEN %s AND %s",
-                $form_id, $start_date, $end_date
-            ),
-            ARRAY_A
-        );
+        // Check if this is a Manual Entry form
+        $is_manual_entry = in_array($form_id, $manual_entry_form_ids);
+        
+        if ($is_manual_entry) {
+            // For Manual Entry: Get ALL entries and filter by Event/Fair Date in PHP
+            $results = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT id, form_id, response, source_url, created_at
+                     FROM {$wpdb->prefix}fluentform_submissions
+                     WHERE form_id = %d",
+                    $form_id
+                ),
+                ARRAY_A
+            );
+            
+            // Filter by Event/Fair Date
+            foreach ($results as $entry) {
+                $response_data = json_decode($entry['response'], true);
+                if (!is_array($response_data)) {
+                    continue;
+                }
+                
+                // Try to find Event/Fair Date
+                $event_date_field = null;
+                if (isset($response_data['datetime_2']) && !empty($response_data['datetime_2'])) {
+                    $event_date_field = $response_data['datetime_2'];
+                } elseif (isset($response_data['datetime_1']) && !empty($response_data['datetime_1'])) {
+                    $event_date_field = $response_data['datetime_1'];
+                } elseif (isset($response_data['datetime']) && !empty($response_data['datetime'])) {
+                    $event_date_field = $response_data['datetime'];
+                } elseif (isset($response_data['event_date']) && !empty($response_data['event_date'])) {
+                    $event_date_field = $response_data['event_date'];
+                } elseif (isset($response_data['fair_date']) && !empty($response_data['fair_date'])) {
+                    $event_date_field = $response_data['fair_date'];
+                }
+                
+                // Only include if Event/Fair Date is within range
+                if ($event_date_field) {
+                    $event_timestamp = strtotime($event_date_field);
+                    if ($event_timestamp && $event_timestamp >= $start_timestamp && $event_timestamp <= $end_timestamp) {
+                        $combined_data[] = $entry;
+                    }
+                }
+            }
+        } else {
+            // For other forms: Use created_at as before
+            $results = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT id, form_id, response, source_url, created_at
+                     FROM {$wpdb->prefix}fluentform_submissions
+                     WHERE form_id = %d
+                       AND created_at BETWEEN %s AND %s",
+                    $form_id, $start_date, $end_date
+                ),
+                ARRAY_A
+            );
 
-        if ($results) {
-            $combined_data = array_merge($combined_data, $results);
+            if ($results) {
+                $combined_data = array_merge($combined_data, $results);
+            }
         }
     }
 
@@ -323,6 +450,9 @@ function export_forms_by_custom_date_range($start_date, $end_date, $form_ids) {
             $last  = $response_data['names']['last_name'] ?? '';
             $full_name = trim($first . ' ' . $last);
         }
+
+        // Get Event/Fair Date from response or use end_date as fallback
+        $event_fair_date = $response_data['datetime_2'] ?? date('Y-m-d', $end_timestamp);
 
         $formatted_data[] = [
             'Entry Date' => $entry['created_at'],
@@ -357,7 +487,7 @@ function export_forms_by_custom_date_range($start_date, $end_date, $form_ids) {
             'HM days a week do you drive alone' => $response_data['dropdown_3'] ?? '',
             'Opt in Form' => (isset($response_data['checkbox_4'][0]) && strtolower($response_data['checkbox_4'][0]) === 'yes') ? 'Yes' : '',
             'Event/Fair Name' => $response_data['input_text_4'] ?? '',
-            'Event/Fair Date' => $response_data['datetime_2'] ?? ''
+            'Event/Fair Date' => $event_fair_date
         ];
     }
 
@@ -413,9 +543,25 @@ function export_forms_by_date_range_separate($month, $year, $form_ids) {
     // Dates
     $start_date = date('Y-m-d', strtotime("$year-$month-01"));
     $end_date   = date('Y-m-t', strtotime("$year-$month-01"));
+    $start_timestamp = strtotime($start_date);
+    $end_timestamp = strtotime($end_date . ' 23:59:59');
 
     $month_name = date('F', strtotime("$year-$month-01"));
     $date_range = strtolower($month_name) . ' ' . date('j', strtotime($start_date)) . '-' . date('j', strtotime($end_date));
+
+    // Get all forms to identify Manual Entry forms
+    $all_forms = $wpdb->get_results("SELECT id, title FROM {$wpdb->prefix}fluentform_forms", ARRAY_A);
+    $manual_entry_form_ids = [];
+    
+    foreach ($all_forms as $form) {
+        // Identify Manual Entry forms
+        if (stripos($form['title'], 'manual') !== false || 
+            stripos($form['title'], 'entry') !== false ||
+            stripos($form['title'], 'fair') !== false ||
+            stripos($form['title'], 'event') !== false) {
+            $manual_entry_form_ids[] = $form['id'];
+        }
+    }
 
     // Create ZIP file for multiple forms
     $zip_filename = 'forms_export_' . strtolower($month_name) . '_' . $year . '.zip';
@@ -434,16 +580,64 @@ function export_forms_by_date_range_separate($month, $year, $form_ids) {
     }
 
     foreach ($form_ids as $form_id) {
-        $results = $wpdb->get_results(
-            $wpdb->prepare(
-                "SELECT id, form_id, response, source_url, created_at
-                 FROM {$wpdb->prefix}fluentform_submissions
-                 WHERE form_id = %d
-                   AND created_at BETWEEN %s AND %s",
-                $form_id, $start_date, $end_date
-            ),
-            ARRAY_A
-        );
+        // Check if this is a Manual Entry form
+        $is_manual_entry = in_array($form_id, $manual_entry_form_ids);
+        
+        if ($is_manual_entry) {
+            // For Manual Entry: Get ALL entries and filter by Event/Fair Date in PHP
+            $all_results = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT id, form_id, response, source_url, created_at
+                     FROM {$wpdb->prefix}fluentform_submissions
+                     WHERE form_id = %d",
+                    $form_id
+                ),
+                ARRAY_A
+            );
+            
+            // Filter by Event/Fair Date
+            $results = [];
+            foreach ($all_results as $entry) {
+                $response_data = json_decode($entry['response'], true);
+                if (!is_array($response_data)) {
+                    continue;
+                }
+                
+                // Try to find Event/Fair Date
+                $event_date_field = null;
+                if (isset($response_data['datetime_2']) && !empty($response_data['datetime_2'])) {
+                    $event_date_field = $response_data['datetime_2'];
+                } elseif (isset($response_data['datetime_1']) && !empty($response_data['datetime_1'])) {
+                    $event_date_field = $response_data['datetime_1'];
+                } elseif (isset($response_data['datetime']) && !empty($response_data['datetime'])) {
+                    $event_date_field = $response_data['datetime'];
+                } elseif (isset($response_data['event_date']) && !empty($response_data['event_date'])) {
+                    $event_date_field = $response_data['event_date'];
+                } elseif (isset($response_data['fair_date']) && !empty($response_data['fair_date'])) {
+                    $event_date_field = $response_data['fair_date'];
+                }
+                
+                // Only include if Event/Fair Date is within range
+                if ($event_date_field) {
+                    $event_timestamp = strtotime($event_date_field);
+                    if ($event_timestamp && $event_timestamp >= $start_timestamp && $event_timestamp <= $end_timestamp) {
+                        $results[] = $entry;
+                    }
+                }
+            }
+        } else {
+            // For other forms: Use created_at as before
+            $results = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT id, form_id, response, source_url, created_at
+                     FROM {$wpdb->prefix}fluentform_submissions
+                     WHERE form_id = %d
+                       AND created_at BETWEEN %s AND %s",
+                    $form_id, $start_date, $end_date
+                ),
+                ARRAY_A
+            );
+        }
 
         if (empty($results)) {
             continue; // Skip forms with no data
@@ -471,6 +665,9 @@ function export_forms_by_date_range_separate($month, $year, $form_ids) {
                 $last  = $response_data['names']['last_name'] ?? '';
                 $full_name = trim($first . ' ' . $last);
             }
+
+            // Get Event/Fair Date from response or use end_date as fallback
+            $event_fair_date = $response_data['datetime_2'] ?? date('Y-m-d', strtotime($end_date));
 
             $formatted_data[] = [
                 'Entry Date' => $entry['created_at'],
@@ -505,7 +702,7 @@ function export_forms_by_date_range_separate($month, $year, $form_ids) {
                 'HM days a week do you drive alone' => $response_data['dropdown_3'] ?? '',
                 'Opt in Form' => (isset($response_data['checkbox_4'][0]) && strtolower($response_data['checkbox_4'][0]) === 'yes') ? 'Yes' : '',
                 'Event/Fair Name' => $response_data['input_text_4'] ?? '',
-                'Event/Fair Date' => $response_data['datetime_2'] ?? ''
+                'Event/Fair Date' => $event_fair_date
             ];
         }
 
@@ -549,7 +746,7 @@ function export_forms_by_custom_date_range_separate($start_date, $end_date, $for
 
     // Validate dates
     $start_timestamp = strtotime($start_date);
-    $end_timestamp = strtotime($end_date);
+    $end_timestamp = strtotime($end_date . ' 23:59:59');
 
     if (!$start_timestamp || !$end_timestamp) {
         wp_die('Invalid date format provided.');
@@ -563,6 +760,20 @@ function export_forms_by_custom_date_range_separate($start_date, $end_date, $for
     // Format dates for filename
     $filename_start = date('F_j_Y', $start_timestamp);
     $filename_end = date('F_j_Y', $end_timestamp);
+    
+    // Get all forms to identify Manual Entry forms
+    $all_forms = $wpdb->get_results("SELECT id, title FROM {$wpdb->prefix}fluentform_forms", ARRAY_A);
+    $manual_entry_form_ids = [];
+    
+    foreach ($all_forms as $form) {
+        // Identify Manual Entry forms
+        if (stripos($form['title'], 'manual') !== false || 
+            stripos($form['title'], 'entry') !== false ||
+            stripos($form['title'], 'fair') !== false ||
+            stripos($form['title'], 'event') !== false) {
+            $manual_entry_form_ids[] = $form['id'];
+        }
+    }
     
     // Create ZIP file for multiple forms
     $zip_filename = 'forms_export_' . $filename_start . '_to_' . $filename_end . '.zip';
@@ -581,16 +792,64 @@ function export_forms_by_custom_date_range_separate($start_date, $end_date, $for
     }
 
     foreach ($form_ids as $form_id) {
-        $results = $wpdb->get_results(
-            $wpdb->prepare(
-                "SELECT id, form_id, response, source_url, created_at
-                 FROM {$wpdb->prefix}fluentform_submissions
-                 WHERE form_id = %d
-                   AND created_at BETWEEN %s AND %s",
-                $form_id, $start_date, $end_date
-            ),
-            ARRAY_A
-        );
+        // Check if this is a Manual Entry form
+        $is_manual_entry = in_array($form_id, $manual_entry_form_ids);
+        
+        if ($is_manual_entry) {
+            // For Manual Entry: Get ALL entries and filter by Event/Fair Date in PHP
+            $all_results = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT id, form_id, response, source_url, created_at
+                     FROM {$wpdb->prefix}fluentform_submissions
+                     WHERE form_id = %d",
+                    $form_id
+                ),
+                ARRAY_A
+            );
+            
+            // Filter by Event/Fair Date
+            $results = [];
+            foreach ($all_results as $entry) {
+                $response_data = json_decode($entry['response'], true);
+                if (!is_array($response_data)) {
+                    continue;
+                }
+                
+                // Try to find Event/Fair Date
+                $event_date_field = null;
+                if (isset($response_data['datetime_2']) && !empty($response_data['datetime_2'])) {
+                    $event_date_field = $response_data['datetime_2'];
+                } elseif (isset($response_data['datetime_1']) && !empty($response_data['datetime_1'])) {
+                    $event_date_field = $response_data['datetime_1'];
+                } elseif (isset($response_data['datetime']) && !empty($response_data['datetime'])) {
+                    $event_date_field = $response_data['datetime'];
+                } elseif (isset($response_data['event_date']) && !empty($response_data['event_date'])) {
+                    $event_date_field = $response_data['event_date'];
+                } elseif (isset($response_data['fair_date']) && !empty($response_data['fair_date'])) {
+                    $event_date_field = $response_data['fair_date'];
+                }
+                
+                // Only include if Event/Fair Date is within range
+                if ($event_date_field) {
+                    $event_timestamp = strtotime($event_date_field);
+                    if ($event_timestamp && $event_timestamp >= $start_timestamp && $event_timestamp <= $end_timestamp) {
+                        $results[] = $entry;
+                    }
+                }
+            }
+        } else {
+            // For other forms: Use created_at as before
+            $results = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT id, form_id, response, source_url, created_at
+                     FROM {$wpdb->prefix}fluentform_submissions
+                     WHERE form_id = %d
+                       AND created_at BETWEEN %s AND %s",
+                    $form_id, $start_date, $end_date
+                ),
+                ARRAY_A
+            );
+        }
 
         if (empty($results)) {
             continue; // Skip forms with no data
@@ -618,6 +877,9 @@ function export_forms_by_custom_date_range_separate($start_date, $end_date, $for
                 $last  = $response_data['names']['last_name'] ?? '';
                 $full_name = trim($first . ' ' . $last);
             }
+
+            // Get Event/Fair Date from response or use end_date as fallback
+            $event_fair_date = $response_data['datetime_2'] ?? date('Y-m-d', $end_timestamp);
 
             $formatted_data[] = [
                 'Entry Date' => $entry['created_at'],
@@ -652,7 +914,7 @@ function export_forms_by_custom_date_range_separate($start_date, $end_date, $for
                 'HM days a week do you drive alone' => $response_data['dropdown_3'] ?? '',
                 'Opt in Form' => (isset($response_data['checkbox_4'][0]) && strtolower($response_data['checkbox_4'][0]) === 'yes') ? 'Yes' : '',
                 'Event/Fair Name' => $response_data['input_text_4'] ?? '',
-                'Event/Fair Date' => $response_data['datetime_2'] ?? ''
+                'Event/Fair Date' => $event_fair_date
             ];
         }
 
@@ -697,13 +959,13 @@ function export_forms_by_custom_date_range_separate($start_date, $end_date, $for
 function pick_prize_drawing_winners($start_date, $end_date) {
     global $wpdb;
 
-    // Validar y corregir fechas
+    // Validate and correct dates
     $start_timestamp = strtotime($start_date);
     $end_timestamp = strtotime($end_date);
 
-    // Si las fechas no son válidas, usar fechas predeterminadas recientes
+    // If dates are not valid, use recent default dates
     if (!$start_timestamp || !$end_timestamp) {
-        // Usar el mes actual como predeterminado
+        // Use current month as default
         $current_year = date('Y');
         $current_month = date('n');
         $start_date = date('Y-m-d', strtotime("$current_year-$current_month-01"));
@@ -712,7 +974,7 @@ function pick_prize_drawing_winners($start_date, $end_date) {
         $end_timestamp = strtotime($end_date);
     }
 
-    // Asegurar que start_date es anterior a end_date
+    // Ensure that start_date is before end_date
     if ($start_timestamp > $end_timestamp) {
         $temp = $start_date;
         $start_date = $end_date;
@@ -832,7 +1094,7 @@ function pick_prize_drawing_winners($start_date, $end_date) {
         wp_die('No Prize Drawings submissions found in the specified date range (' . $start_date . ' to ' . $end_date . ').');
     }
 
-    // El resto de la función permanece igual...
+    // The rest of the function remains the same...
     // Process submissions and create weighted entries
     $weighted_entries = [];
     $participants_data = [];
@@ -1465,6 +1727,7 @@ function export_forms_page() {
 
                     <div class="quick-date-buttons">
                         <button type="button" class="button button-secondary" id="set-range-last-30">Last 30 Days</button>
+                        <button type="button" class="button button-secondary" id="set-range-last-60">Last 60 Days</button>
                         <button type="button" class="button button-secondary" id="set-range-last-90">Last 90 Days</button>
                         <button type="button" class="button button-secondary" id="set-range-this-year">This Year</button>
                         <button type="button" class="button button-secondary" id="set-range-from-2025">From Jan 1, 2025</button>
@@ -1762,13 +2025,13 @@ function syncPrizeDrawingDates() {
         const selectedYear = parseInt(document.getElementById("selected_year").value, 10);
         
         if (selectedMonth && selectedYear) {
-            // Asegurar que el mes tiene dos dígitos
+            // Ensure the month has two digits
             const monthStr = selectedMonth.toString().padStart(2, "0");
             
-            // Formato YYYY-MM-DD para PHP
+            // Format YYYY-MM-DD for PHP
             const startDate = `${selectedYear}-${monthStr}-01`;
             
-            // Calcular último día del mes
+            // Calculate last day of the month
             const lastDay = new Date(selectedYear, selectedMonth, 0).getDate();
             const endDate = `${selectedYear}-${monthStr}-${lastDay}`;
             
@@ -1778,15 +2041,15 @@ function syncPrizeDrawingDates() {
             document.getElementById("prize_selected_year").value = selectedYear;
         }
     } else {
-        // Custom range mode - usar las entradas de fecha
+        // Custom range mode - use date inputs
         const startDateInput = document.getElementById("start_date").value;
         const endDateInput = document.getElementById("end_date").value;
         
-        // Los input type="date" usan formato YYYY-MM-DD
+        // The input type="date" uses YYYY-MM-DD format
         document.getElementById("prize_start_date").value = startDateInput;
         document.getElementById("prize_end_date").value = endDateInput;
         
-        // Limpiar campos mensuales en modo de rango personalizado
+        // Clear monthly fields in custom range mode
         document.getElementById("prize_selected_month").value = "";
         document.getElementById("prize_selected_year").value = "";
     }
@@ -1802,6 +2065,12 @@ function syncPrizeDrawingDates() {
         document.getElementById("set-range-last-30")?.addEventListener("click", ()=>{
             const endDate = new Date().toISOString().split("T")[0];
             const startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+            setDateRange(startDate, endDate);
+        });
+
+        document.getElementById("set-range-last-60")?.addEventListener("click", ()=>{
+            const endDate = new Date().toISOString().split("T")[0];
+            const startDate = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
             setDateRange(startDate, endDate);
         });
 
